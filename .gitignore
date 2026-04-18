@@ -1,0 +1,20 @@
+# Local environments
+.venv/
+.venv_clean/
+
+# Dataset artifacts
+2days/
+2days.tar.gz
+
+# Notebook and Python caches
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+
+# IDE files
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
