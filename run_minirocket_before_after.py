@@ -29,6 +29,13 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for tsai dataloaders.")
     parser.add_argument("--chunksize", type=int, default=64, help="MiniRocket feature extraction chunk size.")
     parser.add_argument("--max-length", type=int, default=4096, help="Maximum sequence length used by the dataset manager.")
+    parser.add_argument(
+        "--normalization",
+        type=str,
+        choices=("global", "fold"),
+        default="global",
+        help="Use paper-style global min/max stats or recompute min/max from each training fold.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     return parser.parse_args()
 
@@ -47,8 +54,30 @@ def set_seed(seed: int):
 
 
 def normalize_features(data: np.ndarray, mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
-    scaled = (data - mins) / (maxs - mins)
+    ranges = np.where(maxs > mins, maxs - mins, 1.0)
+    scaled = (data - mins) / ranges
     return np.nan_to_num(scaled, copy=False)
+
+
+def compute_fold_minmax(dm: NGAFID_Dataset_Manager, sample_ids) -> tuple[np.ndarray, np.ndarray]:
+    mins = np.full(dm.channels, np.inf, dtype=np.float32)
+    maxs = np.full(dm.channels, -np.inf, dtype=np.float32)
+
+    for sample_id in sample_ids:
+        flight = np.asarray(dm.flight_data_array[sample_id], dtype=np.float32)
+        if flight.size == 0:
+            continue
+
+        finite = np.isfinite(flight)
+        if not finite.any():
+            continue
+
+        mins = np.minimum(mins, np.where(finite, flight, np.inf).min(axis=0))
+        maxs = np.maximum(maxs, np.where(finite, flight, -np.inf).max(axis=0))
+
+    mins = np.where(np.isfinite(mins), mins, dm.mins)
+    maxs = np.where(np.isfinite(maxs), maxs, dm.maxs)
+    return mins, maxs
 
 
 def build_dataset_manager(dataset_dir: Path, max_length: int) -> NGAFID_Dataset_Manager:
@@ -65,15 +94,48 @@ def select_positive_class_scores(probabilities: np.ndarray) -> np.ndarray:
     return probabilities[:, 1]
 
 
-def train_single_fold(dm: NGAFID_Dataset_Manager, fold: int, args) -> dict:
+def build_prediction_records(
+    dm: NGAFID_Dataset_Manager,
+    fold: int,
+    test_dict: dict,
+    pred_labels: np.ndarray,
+    positive_scores: np.ndarray,
+    args,
+) -> pd.DataFrame:
+    sample_ids = np.asarray(test_dict["id"])
+    true_labels = np.asarray(test_dict["before_after"], dtype=np.int64)
+    seq_lens = [int(min(dm.flight_data_array[sample_id].shape[0], args.max_length)) for sample_id in sample_ids]
+
+    return pd.DataFrame(
+        {
+            "fold": fold,
+            "id": sample_ids.astype(int),
+            "target_class": np.asarray(test_dict["target_class"], dtype=np.int64),
+            "class": np.asarray(test_dict["class"]),
+            "hclass": np.asarray(test_dict["hclass"]),
+            "true_label": true_labels,
+            "pred_label": pred_labels.astype(int),
+            "positive_score": positive_scores.astype(float),
+            "correct": (pred_labels == true_labels).astype(int),
+            "seq_len": seq_lens,
+        }
+    )
+
+
+def train_single_fold(dm: NGAFID_Dataset_Manager, fold: int, args) -> tuple[dict, pd.DataFrame]:
     train_dict = dm.get_numpy_dataset(fold=fold, training=True)
     test_dict = dm.get_numpy_dataset(fold=fold, training=False)
 
     train_x = np.asarray(train_dict["data"], dtype=np.float32)
     test_x = np.asarray(test_dict["data"], dtype=np.float32)
 
-    train_x = normalize_features(train_x, dm.mins, dm.maxs)
-    test_x = normalize_features(test_x, dm.mins, dm.maxs)
+    if args.normalization == "fold":
+        mins, maxs = compute_fold_minmax(dm, train_dict["id"])
+    else:
+        mins, maxs = dm.mins, dm.maxs
+
+    train_x = normalize_features(train_x, mins, maxs)
+    test_x = normalize_features(test_x, mins, maxs)
 
     train_y = np.asarray(train_dict["before_after"], dtype=np.int64)
     test_y = np.asarray(test_dict["before_after"], dtype=np.int64)
@@ -109,6 +171,7 @@ def train_single_fold(dm: NGAFID_Dataset_Manager, fold: int, args) -> dict:
         "fold": fold,
         "train_size": int(len(train_y)),
         "test_size": int(len(test_y)),
+        "normalization": args.normalization,
         "accuracy": float(accuracy_score(targets, pred_labels)),
         "f1": float(f1_score(targets, pred_labels, zero_division=0)),
     }
@@ -118,7 +181,8 @@ def train_single_fold(dm: NGAFID_Dataset_Manager, fold: int, args) -> dict:
     except ValueError:
         fold_metrics["roc_auc"] = None
 
-    return fold_metrics
+    prediction_records = build_prediction_records(dm, fold, test_dict, pred_labels, positive_scores, args)
+    return fold_metrics, prediction_records
 
 
 def summarize_results(results_df: pd.DataFrame) -> dict:
@@ -141,18 +205,23 @@ def summarize_results(results_df: pd.DataFrame) -> dict:
     return summary
 
 
-def save_outputs(results_df: pd.DataFrame, summary: dict, results_dir: Path):
+def save_outputs(results_df: pd.DataFrame, summary: dict, results_dir: Path, predictions_df: pd.DataFrame | None = None):
     results_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = results_dir / f"{RESULTS_BASENAME}.csv"
     json_path = results_dir / f"{RESULTS_BASENAME}_summary.json"
+    predictions_path = results_dir / f"{RESULTS_BASENAME}_predictions.csv"
 
     results_df.to_csv(csv_path, index=False)
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
+    if predictions_df is not None:
+        predictions_df.to_csv(predictions_path, index=False)
 
     print(f"\nSaved fold metrics to: {csv_path}")
     print(f"Saved summary metrics to: {json_path}")
+    if predictions_df is not None:
+        print(f"Saved per-sample predictions to: {predictions_path}")
 
 
 def print_summary(results_df: pd.DataFrame, summary: dict):
@@ -184,23 +253,29 @@ def main():
     print(f"Using dataset directory: {dataset_dir}")
     print(f"Using results directory: {results_dir}")
     print(f"Running folds: {folds}")
+    print(f"Normalization: {args.normalization}")
     print(f"Device: {default_device()}")
 
     dm = build_dataset_manager(dataset_dir=dataset_dir, max_length=args.max_length)
 
     fold_results = []
+    prediction_records = []
     for fold in folds:
         print(f"\n===== Fold {fold} / 4 =====")
-        fold_result = train_single_fold(dm=dm, fold=fold, args=args)
+        fold_result, fold_predictions = train_single_fold(dm=dm, fold=fold, args=args)
         fold_results.append(fold_result)
+        prediction_records.append(fold_predictions)
         print(
             f"Fold {fold} metrics -> accuracy: {fold_result['accuracy']:.4f}, "
             f"f1: {fold_result['f1']:.4f}, roc_auc: {fold_result['roc_auc']}"
         )
 
     results_df = pd.DataFrame(fold_results).sort_values("fold").reset_index(drop=True)
+    predictions_df = pd.concat(prediction_records, ignore_index=True)
     summary = summarize_results(results_df)
-    save_outputs(results_df, summary, results_dir)
+    summary["normalization"] = args.normalization
+    summary["max_length"] = args.max_length
+    save_outputs(results_df, summary, results_dir, predictions_df=predictions_df)
     print_summary(results_df, summary)
 
 

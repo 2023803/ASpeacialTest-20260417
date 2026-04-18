@@ -1,0 +1,11 @@
+{
+  "num_folds": 5,
+  "accuracy_mean": 0.5961902091071595,
+  "accuracy_std": 0.006745224055840373,
+  "f1_mean": 0.5751726000126254,
+  "f1_std": 0.006625104790073015,
+  "roc_auc_mean": 0.636392679998926,
+  "roc_auc_std": 0.007120970510522572,
+  "normalization": "global",
+  "max_length": 2048
+}
