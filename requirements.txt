@@ -1,0 +1,10 @@
+gdown==6.0.0
+tensorflow==2.21.0
+numpy==2.4.3
+pandas==3.0.2
+loguru==0.7.3
+scikit-learn==1.8.0
+tqdm==4.67.3
+compress-pickle==2.1.0
+tsai==0.4.1
+torch==2.7.1
